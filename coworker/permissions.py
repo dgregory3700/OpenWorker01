@@ -39,8 +39,11 @@ _INTERPRETERS = {
     "sh", "bash", "zsh", "dash", "ksh", "fish", "powershell", "pwsh", "cmd",
     "python", "python3", "node", "deno", "bun", "ruby", "perl", "php",
 }
-# Flags that turn a search/list tool into an execution or deletion tool.
-_DANGEROUS_FLAGS = {"-exec", "-execdir", "-delete", "-ok", "-okdir", "-fprintf"}
+# Flags that turn a search/list tool into an execution, deletion, or file-writing tool.
+# The fprint family writes find's output to an arbitrary path; omitting it let a bare
+# `find` allowlist entry auto-run `find . -fprint /tmp/exfil.txt`. readonly.py's
+# `_FIND_BAD` is the complete copy of this set, so keep the two in step.
+_DANGEROUS_FLAGS = {"-exec", "-execdir", "-delete", "-ok", "-okdir", "-fprintf", "-fprint", "-fprint0", "-fls"}
 
 
 def _split_commands(command: str) -> list[str]:
@@ -267,15 +270,11 @@ def standing_rule_candidate(
     (UX-DECISIONS §25): external-risk only (never exec/write-local — shell asks forever),
     the tool must declare a target argument, and the call must actually name a target.
     Returns None otherwise — ineligible calls keep parking approvals as today."""
-    from .connectors.tool_defs import target_arg_for
+    from .connectors.tool_defs import standing_target_for
 
     if classify(tool_name, metadata, overrides) is not RiskClass.EXTERNAL:
         return None
-    arg = target_arg_for(tool_name)
-    if arg is None:
-        return None
-    value = str((arguments or {}).get(arg) or "").strip()
-    return value or None
+    return standing_target_for(tool_name, arguments or {})
 
 
 @dataclass
@@ -305,6 +304,12 @@ class PermissionEngine:
     # ScheduledTask's target-shaped entries. Kept by reference and re-read every check, so a
     # rule minted mid-run ("Allow every time") applies to the run's next call too.
     task_rules: dict[str, set[str]] = field(default_factory=dict)
+    # Thread grants (spec §11.4): the origin threads this session may answer without
+    # asking. Each entry expands into task_rules for the platform's reply tools (the
+    # manager's `_grant_thread_rules`); persisted with the session's grants and
+    # re-applied on rebuild, so a subscribed session tagged in a thread keeps its
+    # grant across restarts (mention-spawned sessions also re-derive from the thread map).
+    thread_grants: set[str] = field(default_factory=set)
     # User-local risk override resolver (Phase 2). None → use the base classification.
     risk_overrides: Optional[RiskOverrides] = None
     # OPE-136 durable trust: tool name → has the user minted a standing "don't ask" rule?
