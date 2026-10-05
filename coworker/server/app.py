@@ -167,6 +167,17 @@ from ..inbox import VIS_INBOX, VIS_INLINE, args_preview
 from ..permissions import Mode
 from ..providers import AssistantTurn
 from .. import toolchain
+
+
+def _session_sandbox(engine: Any) -> dict[str, Any]:
+    """The session's sandbox, for its header chip. Never raises: a header must not break
+    a session."""
+    try:
+        from ..sandbox.settings import session_sandbox
+
+        return session_sandbox(engine)
+    except Exception:  # noqa: BLE001
+        return {"state": "off"}
 from ..teams.model import AuthorityError as TeamsAuthorityError
 from ..teams.model import BoardError as TeamsBoardError
 from ..teams.model import BoardNotFoundError as TeamsBoardNotFoundError
@@ -429,7 +440,10 @@ def create_app(manager: SessionManager) -> FastAPI:
 
     @app.get("/v1/sessions/{session_id}/unattended")
     def get_unattended(session_id: str) -> dict[str, Any]:
-        return {"unattended": manager.unattended.is_unattended(session_id)}
+        return {
+            "unattended": manager.unattended.is_unattended(session_id),
+            "attendance": manager.unattended.attendance(session_id),
+        }
 
     @app.get("/v1/sessions/{session_id}/reviewer-stats")
     def get_reviewer_stats(session_id: str) -> dict[str, Any]:
@@ -440,8 +454,10 @@ def create_app(manager: SessionManager) -> FastAPI:
     @app.post("/v1/sessions/{session_id}/unattended")
     def set_unattended(session_id: str, body: dict) -> dict[str, Any]:
         # The GUI gates the on-transition behind a one-tap confirm; the manager records the
-        # transition either way, so the change is answerable from the audit store.
-        return manager.set_unattended(session_id, bool(body.get("unattended")))
+        # transition either way, so the change is answerable from the audit store. Newer
+        # clients send `attendance` ("attended" / "inbox" / "auto"); older ones the boolean.
+        value = body["attendance"] if "attendance" in body else bool(body.get("unattended"))
+        return manager.set_unattended(session_id, value)
 
     @app.get("/v1/sessions/{session_id}/skills")
     def session_skills(session_id: str, workspace: str = "") -> dict[str, Any]:
@@ -788,6 +804,19 @@ def create_app(manager: SessionManager) -> FastAPI:
     @app.delete("/v1/sessions/{session_id}/roots")
     def session_remove_root(session_id: str, path: str) -> dict[str, Any]:
         return manager.remove_root(session_id, path)
+
+    # OPE-219: the session's allowed sites, for its header chip and Access section.
+    @app.get("/v1/sessions/{session_id}/sites")
+    def session_sites(session_id: str) -> dict[str, Any]:
+        return {"sandbox": manager.session_sites(session_id)}
+
+    @app.post("/v1/sessions/{session_id}/sites")
+    def session_allow_site(session_id: str, body: dict) -> dict[str, Any]:
+        return manager.allow_session_site(session_id, str((body or {}).get("host", "")))
+
+    @app.delete("/v1/sessions/{session_id}/sites")
+    def session_remove_site(session_id: str, host: str) -> dict[str, Any]:
+        return manager.remove_session_site(session_id, host)
 
     @app.get("/v1/sessions/{session_id}/artifacts")
     def session_artifacts(session_id: str) -> dict[str, Any]:
@@ -2922,6 +2951,9 @@ def create_app(manager: SessionManager) -> FastAPI:
         # configuration, or a worker under an auto-approve lead) is reviewed even when
         # nobody attends it.
         engine.is_attended = lambda: _visibility() == VIS_INLINE or manager.reviewer_opted(session_id)
+        # Attendance "auto" (coworker/unattended.py): the engine answers by rule instead of
+        # routing to the Inbox. Read live, so the toggle applies mid-session.
+        engine.attendance = lambda: manager.unattended.attendance(session_id)
         await ws.send_json(
             {
                 "type": "ready",
@@ -2934,6 +2966,8 @@ def create_app(manager: SessionManager) -> FastAPI:
                     "agent": getattr(engine, "agent_name", "code"),
                     "model": engine.model,
                     "mode": engine.permissions.mode.value,
+                    # OPE-218: the header chip says which walls this session runs behind.
+                    "sandbox": _session_sandbox(engine),
                     "workspace": (
                         str(getattr(engine, "executor").cwd)
                         if getattr(engine, "executor", None)
@@ -3135,6 +3169,16 @@ def create_app(manager: SessionManager) -> FastAPI:
                     except (TypeError, ValueError):
                         pass
                     else:
+                        if (
+                            new_mode is Mode.DANGEROUSLY_BYPASS_APPROVALS
+                            and not manager.allow_dangerous_mode
+                        ):
+                            await reject_input(
+                                "dangerously-bypass-approvals is not available here: "
+                                "start the server with --allow-dangerous-mode, and only "
+                                "on a disposable machine or container."
+                            )
+                            continue
                         previous = engine.permissions.mode
                         engine.permissions.mode = new_mode
                         if previous is not new_mode:
